@@ -1,0 +1,3 @@
+rootProject.name = "lib-nayax-yuyue"
+include ':app'
+include ':nayax'

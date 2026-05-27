@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:gravity="center_horizontal"
+    android:orientation="vertical"
+    tools:context=".MainActivity">
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="40dp"
+        android:gravity="center"
+        android:text="开启串口"
+        android:onClick="startPort"/>
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="20dp"
+        android:gravity="center"
+        android:text="关闭串口"
+        android:onClick="stopPort"/>
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="20dp"
+        android:gravity="center"
+        android:text="发起收款（随机金额）"
+        android:onClick="startMoney"/>
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="20dp"
+        android:gravity="center"
+        android:text="发起收款（货道2）"
+        android:onClick="startMoneyChannel2"/>
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="20dp"
+        android:gravity="center"
+        android:text="取消收款"
+        android:onClick="cancelMoney"/>
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="20dp"
+        android:gravity="center"
+        android:text="上报出货成功"
+        android:onClick="reportSuccess"/>
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="20dp"
+        android:gravity="center"
+        android:text="上报出货失败"
+        android:onClick="reportFail"/>
+
+</LinearLayout>

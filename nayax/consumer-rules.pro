@@ -1,0 +1,2 @@
+﻿-keep class com.dawn.nayax.** { *; }
+-keepclassmembers class com.dawn.nayax.** { *; }
