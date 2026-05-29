@@ -64,6 +64,10 @@ public class NayaxManager {
     private static final int MSG_OPERATION_TIMEOUT   = 0x07;
     /** 串口打开后检查接收线程是否存活 */
     private static final int MSG_STREAM_CHECK        = 0x08;
+    /** 收款前状态预查超时 */
+    private static final int MSG_CHECK_STATE_TIMEOUT = 0x09;
+    /** 发出货失败后延迟重新发起收款 */
+    private static final int MSG_RETRY_PAYMENT       = 0x0A;
 
     // ==================== 时间常量（ms） ====================
     /** 串口打开后延迟发送复位指令的时间 */
@@ -80,6 +84,8 @@ public class NayaxManager {
     private static final long OPERATION_TIMEOUT_MS     = 8_000L;
     /** 基础重连延迟 */
     private static final long RECONNECT_BASE_DELAY_MS  = 3000L;
+    /** 两条指令之间的最小间隔，防止通讯卡顿 */
+    private static final long MIN_CMD_INTERVAL_MS      = 500L;
 
     // ==================== 配置常量 ====================
     private static final int BAUD_RATE               = 9600;
@@ -107,7 +113,9 @@ public class NayaxManager {
         /** 轮询状态等待扣款确认（yy=2） */
         POLLING_DEDUCTION,
         /** 已发送出货结果，等待 echo */
-        REPORTING_RESULT
+        REPORTING_RESULT,
+        /** 收款前发状态查询，等待设备返回 yy 值再决策 */
+        CHECKING_STATE
     }
 
     // ==================== 单例 ====================
@@ -138,6 +146,10 @@ public class NayaxManager {
     private int     mdbLevel = 3;
     /** 当前分辨率（从设备查询获取，默认 0.01） */
     private float   resolution = NayaxCommand.RESOLUTION;
+    /** 是否有待执行的收款请求（等待初始化完成后自动继续），paymentAmount/paymentChannel 已保存 */
+    private boolean pendingPayment = false;
+    /** 上一次发送指令的时间戳，用于保证指令间隔 >= MIN_CMD_INTERVAL_MS */
+    private long    lastSendTimeMs = 0L;
 
     // ==================== 数据缓冲 ====================
     private final StringBuilder dataBuffer = new StringBuilder();
@@ -257,6 +269,15 @@ public class NayaxManager {
     /**
      * 发起收款
      *
+     * <p>内部逻辑：</p>
+     * <ol>
+     *   <li>若串口未连接，报错返回</li>
+     *   <li>若设备未初始化，自动发起初始化；初始化完成后自动继续收款</li>
+     *   <li>若设备已就绪，先查询设备状态：<br>
+     *       - yy=0（待刷卡）：直接发收款指令<br>
+     *       - yy 非 0（设备有挂起状态）：先发出货失败清除状态，等响应后再发收款</li>
+     * </ol>
+     *
      * @param amount  收款金额（元，&gt;0）
      * @param channel 货道编号（从 1 开始）
      */
@@ -269,10 +290,6 @@ public class NayaxManager {
             notifyError(ERROR_NOT_READY, "串口未连接");
             return;
         }
-        if (!deviceReady) {
-            notifyError(ERROR_NOT_READY, "设备未就绪，请等待初始化完成");
-            return;
-        }
         if (amount <= 0) {
             notifyError(ERROR_SEND, "收款金额必须大于 0");
             return;
@@ -282,40 +299,43 @@ public class NayaxManager {
             return;
         }
 
-        paying         = true;
         paymentAmount  = amount;
         paymentChannel = channel;
-        cancelHeartbeat();
 
-        NayaxLog.i(TAG, "发起收款: amount=" + amount + " channel=" + channel
-                + " mdbLevel=" + mdbLevel);
-
-        if (mdbLevel >= 3) {
-            // L3：直接发送扣款指令
-            sendDeductionRequest();
-        } else {
-            // L1/L2：等待用户刷卡
-            currentState = State.WAITING_CARD;
-            schedulePaymentPoll();
-            schedulePaymentTimeout();
+        if (!deviceReady) {
+            // 设备未就绪：记录 pending，自动触发初始化；初始化完成后 onDeviceReady 会继续
+            NayaxLog.i(TAG, "设备未初始化，自动发起初始化，收款请求将在就绪后执行");
+            pendingPayment = true;
+            startInit();
+            return;
         }
+
+        // 设备已就绪：先查询当前状态，由 onCheckingStateFrame 决策
+        NayaxLog.i(TAG, "发起收款前查询设备状态: amount=" + amount + " channel=" + channel);
+        paying = true;
+        pendingPayment = false;
+        cancelHeartbeat();
+        currentState = State.CHECKING_STATE;
+        sendCommand(NayaxCommand.queryStatus());
+        handler.sendEmptyMessageDelayed(MSG_CHECK_STATE_TIMEOUT, OPERATION_TIMEOUT_MS);
     }
 
     /**
      * 取消当前收款
-     * <p>协议无专用取消指令，发送复位命令让设备清除挂起的扣款状态。</p>
+     * <p>协议无专用取消指令，发送出货失败通知设备当前交易作废，
+     * 设备收到后会将刷卡器恢复到待刷卡状态。</p>
      */
     public void cancelPayment() {
-        if (!paying) {
+        if (!paying && !pendingPayment) {
             NayaxLog.w(TAG, "当前无收款进行中");
             return;
         }
-        NayaxLog.i(TAG, "取消收款，发送复位指令通知设备");
+        NayaxLog.i(TAG, "取消收款，发送出货失败指令通知设备");
         cancelAllMessages();
-        paying       = false;
-        currentState = State.HEARTBEAT;
-        // 发复位让设备终止挂起的扣款；echo 在 HEARTBEAT 状态下会被 isStatusResponse 过滤掉
-        sendCommand(NayaxCommand.reset());
+        paying         = false;
+        pendingPayment = false;
+        currentState   = State.HEARTBEAT;
+        sendCommand(NayaxCommand.vendingFail());
         NayaxCallback cb = this.callback;
         if (cb != null) cb.onPaymentCancelled();
         scheduleHeartbeat();
@@ -499,7 +519,24 @@ public class NayaxManager {
             NayaxLog.w(TAG, "串口未连接，无法发送: " + hex);
             return;
         }
+        long now   = System.currentTimeMillis();
+        long delta = now - lastSendTimeMs;
+        if (delta >= MIN_CMD_INTERVAL_MS) {
+            doSendCommand(hex);
+        } else {
+            long delay = MIN_CMD_INTERVAL_MS - delta;
+            NayaxLog.d(TAG, "指令间隔不足，延迟 " + delay + "ms 发送: " + hex);
+            handler.postDelayed(() -> doSendCommand(hex), delay);
+        }
+    }
+
+    private void doSendCommand(String hex) {
+        if (!isConnected()) {
+            NayaxLog.w(TAG, "延迟发送时串口已断开: " + hex);
+            return;
+        }
         NayaxLog.d(TAG, "发送: " + hex);
+        lastSendTimeMs = System.currentTimeMillis();
         serialUtil.sendHex(hex);
     }
 
@@ -601,6 +638,9 @@ public class NayaxManager {
             case HEARTBEAT:
                 onHeartbeatFrame(frame);
                 break;
+            case CHECKING_STATE:
+                onCheckingStateFrame(frame);
+                break;
             case WAITING_CARD:
                 onWaitingCardFrame(frame);
                 break;
@@ -644,7 +684,52 @@ public class NayaxManager {
         currentState = State.HEARTBEAT;
         NayaxCallback cb = this.callback;
         if (cb != null) cb.onDeviceReady();
-        scheduleHeartbeat();
+        if (pendingPayment) {
+            pendingPayment = false;
+            NayaxLog.i(TAG, "初始化完成，继续执行挂起的收款: amount=" + paymentAmount);
+            paying = true;
+            cancelHeartbeat();
+            currentState = State.CHECKING_STATE;
+            sendCommand(NayaxCommand.queryStatus());
+            handler.sendEmptyMessageDelayed(MSG_CHECK_STATE_TIMEOUT, OPERATION_TIMEOUT_MS);
+        } else {
+            scheduleHeartbeat();
+        }
+    }
+
+    /**
+     * CHECKING_STATE：收款前预查状态，根据 yy 值决策
+     * <ul>
+     *   <li>yy=0（IDLE 待刷卡）：设备干净，直接发收款指令</li>
+     *   <li>yy 非 0（有挂起状态）：先发出货失败清除，延迟 1.5s 后重新尝试发起收款</li>
+     * </ul>
+     */
+    private void onCheckingStateFrame(String frame) {
+        if (!NayaxCommand.isStatusResponse(frame)) return;
+        handler.removeMessages(MSG_CHECK_STATE_TIMEOUT);
+        int yy = NayaxCommand.parseCardState(frame);
+        NayaxLog.i(TAG, "收款前状态检查: yy=" + yy);
+        if (yy == NayaxCommand.CardState.IDLE) {
+            NayaxLog.i(TAG, "设备空闲，直接发起收款");
+            doStartDeduction();
+        } else {
+            NayaxLog.w(TAG, "设备非空闲 (yy=" + yy + ")，发出货失败后重试收款");
+            sendCommand(NayaxCommand.vendingFail());
+            handler.sendEmptyMessageDelayed(MSG_RETRY_PAYMENT, 1500L);
+        }
+    }
+
+    /**
+     * 实际发起扣款（CHECKING_STATE 决策后调用，或 MSG_RETRY_PAYMENT 延迟后调用）
+     */
+    private void doStartDeduction() {
+        if (mdbLevel >= 3) {
+            sendDeductionRequest();
+        } else {
+            currentState = State.WAITING_CARD;
+            schedulePaymentPoll();
+            schedulePaymentTimeout();
+        }
     }
 
     /** HEARTBEAT：解析状态响应，检测刷卡器异常 */
@@ -805,6 +890,8 @@ public class NayaxManager {
         handler.removeMessages(MSG_INIT_TIMEOUT);
         handler.removeMessages(MSG_OPERATION_TIMEOUT);
         handler.removeMessages(MSG_STREAM_CHECK);
+        handler.removeMessages(MSG_CHECK_STATE_TIMEOUT);
+        handler.removeMessages(MSG_RETRY_PAYMENT);
     }
 
     private void notifyError(int code, String message) {
@@ -837,16 +924,29 @@ public class NayaxManager {
                 break;
 
             case MSG_PAYMENT_TIMEOUT:
-                NayaxLog.w(TAG, "收款超时，发送复位指令通知设备");
+                NayaxLog.w(TAG, "收款超时，发送出货失败指令通知设备");
                 handler.removeMessages(MSG_POLL_STATUS);
                 paying       = false;
                 currentState = State.HEARTBEAT;
-                // 同 cancelPayment：发复位让设备清除挂起扣款状态
-                sendCommand(NayaxCommand.reset());
+                sendCommand(NayaxCommand.vendingFail());
                 notifyError(ERROR_PAYMENT_TIMEOUT, "收款超时");
                 NayaxCallback cb = this.callback;
                 if (cb != null) cb.onPaymentCancelled();
                 scheduleHeartbeat();
+                break;
+
+            case MSG_CHECK_STATE_TIMEOUT:
+                NayaxLog.w(TAG, "收款前状态查询超时，直接尝试发起收款");
+                if (paying) doStartDeduction();
+                break;
+
+            case MSG_RETRY_PAYMENT:
+                NayaxLog.i(TAG, "重新发起收款（出货失败指令已发）");
+                if (paying) {
+                    currentState = State.CHECKING_STATE;
+                    sendCommand(NayaxCommand.queryStatus());
+                    handler.sendEmptyMessageDelayed(MSG_CHECK_STATE_TIMEOUT, OPERATION_TIMEOUT_MS);
+                }
                 break;
 
             case MSG_RECONNECT:
