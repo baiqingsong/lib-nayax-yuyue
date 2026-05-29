@@ -7,40 +7,37 @@ package com.dawn.nayax;
  *
  * <p>典型使用流程：</p>
  * <pre>
- * NayaxManager.getInstance().setCallback(new NayaxCallback() {
- *     {@literal @}Override public void onDeviceReady() { ... }
- *     {@literal @}Override public void onPaymentSuccess(float amount) { ... }
- *     ...
- * });
- * NayaxManager.getInstance().connect(3);          // 连接串口 3
- * // 等待 onDeviceReady() 后调用：
- * NayaxManager.getInstance().startPayment(2.5f);  // 发起 2.50 元收款
- * // 等待 onPaymentSuccess() 后调用：
- * NayaxManager.getInstance().reportVendingResult(true);
+ * NayaxManager mgr = NayaxManager.getInstance();
+ * mgr.setCallback(callback);
+ * mgr.connect(7);           // 1. 打开串口 → onConnectionChanged(true)
+ * mgr.init();               // 2. 初始化   → onDeviceReady()
+ * mgr.startPayment(2.50f);  // 3. 发起收款 → onPaymentStarted() → onPaymentSuccess()
+ * // 出货结果由库内部自动上报，无需额外调用
  * </pre>
  */
 public interface NayaxCallback {
 
     /**
-     * 设备已就绪
-     * <p>复位成功并收到第一条状态响应后触发。此后可调用 {@link NayaxManager#startPayment}。</p>
+     * 串口连接状态变化
+     *
+     * @param connected true 表示串口已打开，false 表示已断开
+     */
+    void onConnectionChanged(boolean connected);
+
+    /**
+     * 设备初始化成功，可以发起收款
+     * <p>复位 + 分辨率查询完成后触发。</p>
      */
     void onDeviceReady();
 
     /**
      * 扣款请求已被设备接受，等待交易完成
-     * <p>仅在设备确认接受扣款指令（FC=10 响应正常）后触发。</p>
      */
     void onPaymentStarted();
 
     /**
-     * 刷卡成功（MDB L1/L2 模式下用户已刷卡，等待扣款）
-     * <p>MDB L3 模式通常不会触发此回调（直接走扣款流程）。</p>
-     */
-    default void onCardSwiped() {}
-
-    /**
-     * 扣款成功，交易完成
+     * 收款成功，交易完成
+     * <p>库内部会自动向设备上报出货成功，无需外部调用。</p>
      *
      * @param amount 本次收款金额（元，与 {@link NayaxManager#startPayment} 传入值一致）
      */
@@ -52,24 +49,10 @@ public interface NayaxCallback {
     void onPaymentCancelled();
 
     /**
-     * 出货结果已被设备确认
-     *
-     * @param success true 表示已上报出货成功，false 表示已上报出货失败
-     */
-    void onVendingAck(boolean success);
-
-    /**
      * 错误事件
      *
      * @param errorCode 错误码，见 {@link NayaxManager} 中的 {@code ERROR_*} 常量
      * @param message   错误描述
      */
     void onError(int errorCode, String message);
-
-    /**
-     * 串口连接状态变化
-     *
-     * @param connected true 表示已连接，false 表示已断开
-     */
-    void onConnectionChanged(boolean connected);
 }
