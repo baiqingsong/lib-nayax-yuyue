@@ -5,8 +5,6 @@ import android.os.Looper;
 import android.os.Message;
 import android.text.TextUtils;
 
-import com.dawn.serial.LSerialUtil;
-
 import java.lang.ref.WeakReference;
 
 /**
@@ -106,8 +104,12 @@ public class NayaxManager {
     private enum State {
         /** 串口未连接 */
         DISCONNECTED,
+        /** 串口已打开，等待手动调用 init() 发起初始化 */
+        IDLE,
         /** 已发送复位指令，等待 echo 响应 */
         RESETTING,
+        /** 已发送分辨率查询，等待响应 */
+        QUERYING_RESOLUTION,
         /** 设备就绪，心跳轮询中 */
         HEARTBEAT,
         /** 已发送扣款请求，等待设备 ACK（FC=10 响应） */
@@ -125,7 +127,7 @@ public class NayaxManager {
 
     // ==================== 核心字段 ====================
     private final Handler handler;
-    private LSerialUtil serialUtil;
+    private NayaxSerialHelper serialUtil;
     private NayaxCallback callback;
 
     // ==================== 状态字段 ====================
@@ -148,6 +150,8 @@ public class NayaxManager {
     private int     mdbLevel = 3;
     /** 最后一次上报的出货结果（true=成功），用于超时重试 */
     private boolean lastVendingSuccess = true;
+    /** 当前分辨率（从设备查询获取，默认 0.01） */
+    private float   resolution = NayaxCommand.RESOLUTION;
 
     // ==================== 数据缓冲 ====================
     private final StringBuilder dataBuffer = new StringBuilder();
@@ -209,6 +213,23 @@ public class NayaxManager {
         this.reconnectCount  = 0;
         this.manualDisconnect = false;
         openSerialPort();
+    }
+
+    /**
+     * 手动发起设备初始化（发送复位指令）
+     *
+     * <p>必须在 {@link #connect(int)} 且收到 {@link NayaxCallback#onConnectionChanged(boolean)}
+     * 回调为 {@code true} 之后调用。初始化成功后触发 {@link NayaxCallback#onDeviceReady()}。</p>
+     *
+     * <p>将打开串口与发初始化指令分离，便于在确认串口可收发数据后再触发初始化。</p>
+     */
+    public void init() {
+        if (!isConnected()) {
+            notifyError(ERROR_NOT_READY, "串口未连接，请先调用 connect()");
+            return;
+        }
+        NayaxLog.i(TAG, "手动发起初始化（可重复调用）");
+        startInit();
     }
 
     /**
@@ -377,8 +398,8 @@ public class NayaxManager {
         closeSerialPort();
         dataBuffer.setLength(0);
 
-        serialUtil = new LSerialUtil(serialPort, BAUD_RATE, LSerialUtil.SerialType.TYPE_HEX,
-                new LSerialUtil.OnSerialListener() {
+        serialUtil = new NayaxSerialHelper(serialPort, BAUD_RATE,
+                new NayaxSerialHelper.Listener() {
                     @Override
                     public void onOpenError(String portPath, Exception e) {
                         NayaxLog.e(TAG, "串口打开失败: " + portPath, e);
@@ -420,10 +441,8 @@ public class NayaxManager {
         firstDataReceived = false;
         reconnectCount = 0;
         notifyConnectionChanged(true);
-        // 延迟后发送复位指令
-        currentState = State.RESETTING;
-        handler.sendEmptyMessageDelayed(MSG_SEND_RESET, RESET_DELAY_MS);
-        handler.sendEmptyMessageDelayed(MSG_INIT_TIMEOUT, INIT_TIMEOUT_MS);
+        // 串口已就绪，等待调用 init() 手动发起初始化
+        currentState = State.IDLE;
         // 检测接收线程是否存活（LSerialUtil 在 EOF 时不回调，需主动探测）
         handler.sendEmptyMessageDelayed(MSG_STREAM_CHECK, 1500L);
     }
@@ -431,29 +450,13 @@ public class NayaxManager {
     private void closeSerialPort() {
         boolean wasConnected = isConnected();
         if (serialUtil != null) {
-            NayaxLog.i(TAG, "关闭串口 " + serialPort
-                    + (firstDataReceived ? "" : "（接收线程已死，跳过 disconnect 避免 JNI crash）"));
-            if (firstDataReceived || !streamThreadDead()) {
-                try { serialUtil.disconnect(); } catch (Exception e) {
-                    NayaxLog.w(TAG, "关闭串口异常", e);
-                }
+            NayaxLog.i(TAG, "关闭串口 " + serialPort);
+            try { serialUtil.disconnect(); } catch (Exception e) {
+                NayaxLog.w(TAG, "关闭串口异常", e);
             }
             serialUtil = null;
         }
         if (wasConnected) notifyConnectionChanged(false);
-    }
-
-    /**
-     * 判断 LSerialUtil 的接收线程是否已死亡（即从未收到任何数据）。
-     * <p>LSerialUtil 在接收流 EOF 时不回调 onReceiveError，接收线程静默退出。
-     * 此时调用 {@code LSerialUtil.disconnect()} 会触发 SafeSerialPort.close() JNI crash（
-     * NoSuchFieldError: mFd），因此必须跳过。</p>
-     */
-    private boolean streamThreadDead() {
-        // 若串口打开后从未收到任何数据，且当前仍处于初始化/复位状态，
-        // 判断接收线程已死（LSerialUtil HEX输入流已结束）
-        return !firstDataReceived
-                && (currentState == State.RESETTING || currentState == State.DISCONNECTED);
     }
 
     private void handlePortOpenFailed() {
@@ -494,16 +497,28 @@ public class NayaxManager {
 
     // ==================== 指令发送 ====================
 
+    private void startInit() {
+        NayaxLog.i(TAG, "发起初始化序列");
+        deviceReady = false;
+        currentState = State.RESETTING;
+        operationRetryCount = 0;
+        handler.removeMessages(MSG_SEND_RESET);
+        handler.removeMessages(MSG_INIT_TIMEOUT);
+        handler.removeMessages(MSG_OPERATION_TIMEOUT);
+        handler.sendEmptyMessageDelayed(MSG_SEND_RESET, RESET_DELAY_MS);
+    }
+
     private void sendReset() {
         NayaxLog.i(TAG, "发送复位指令");
         sendCommand(NayaxCommand.reset());
     }
 
     private void sendDeductionRequest() {
-        int amountCents = Math.round(paymentAmount / NayaxCommand.RESOLUTION);
-        String cmd = NayaxCommand.requestDeduction(paymentChannel, amountCents);
+        int amountUnits = Math.round(paymentAmount / resolution);
+        String cmd = NayaxCommand.requestDeduction(paymentChannel, amountUnits);
         NayaxLog.i(TAG, "发送扣款请求: channel=" + paymentChannel
-                + " amountCents=" + amountCents + " cmd=" + cmd);
+                + " amount=" + paymentAmount + "元 resolution=" + resolution
+                + " amountUnits=" + amountUnits + " cmd=" + cmd);
         currentState        = State.REQUESTING_DEDUCTION;
         operationRetryCount = 0;
         sendCommand(cmd);
@@ -615,6 +630,9 @@ public class NayaxManager {
             case RESETTING:
                 onResetFrame(frame);
                 break;
+            case QUERYING_RESOLUTION:
+                onResolutionFrame(frame);
+                break;
             case HEARTBEAT:
                 onHeartbeatFrame(frame);
                 break;
@@ -640,17 +658,28 @@ public class NayaxManager {
 
     /** RESETTING：等待复位 echo */
     private void onResetFrame(String frame) {
-        // 复位 ACK = echo of reset command
         if (NayaxCommand.isWriteSingleAck(frame)
                 && frame.toUpperCase().startsWith("010600080001")) {
-            handler.removeMessages(MSG_INIT_TIMEOUT);
-            NayaxLog.i(TAG, "复位成功，设备就绪");
-            deviceReady  = true;
-            currentState = State.HEARTBEAT;
-            NayaxCallback cb = this.callback;
-            if (cb != null) cb.onDeviceReady();
-            scheduleHeartbeat();
+            handler.removeMessages(MSG_OPERATION_TIMEOUT);
+            NayaxLog.i(TAG, "复位成功，开始查询分辨率");
+            currentState = State.QUERYING_RESOLUTION;
+            operationRetryCount = 0;
+            sendCommand(NayaxCommand.queryResolution());
+            scheduleOperationTimeout();
         }
+    }
+
+    /** QUERYING_RESOLUTION：解析分辨率响应 */
+    private void onResolutionFrame(String frame) {
+        if (!NayaxCommand.isStatusResponse(frame)) return;
+        handler.removeMessages(MSG_OPERATION_TIMEOUT);
+        resolution = NayaxCommand.parseResolutionValue(frame);
+        NayaxLog.i(TAG, "分辨率查询完成: " + resolution);
+        deviceReady  = true;
+        currentState = State.HEARTBEAT;
+        NayaxCallback cb = this.callback;
+        if (cb != null) cb.onDeviceReady();
+        scheduleHeartbeat();
     }
 
     /** HEARTBEAT：解析状态响应，检测刷卡器异常 */
@@ -753,6 +782,23 @@ public class NayaxManager {
         operationRetryCount++;
         if (operationRetryCount > MAX_OPERATION_RETRIES) {
             NayaxLog.e(TAG, "操作超时，已达最大重试次数，状态: " + currentState);
+            if (currentState == State.RESETTING) {
+                // 初始化重试耗尽：串口保持打开，等待用户手动再调 init()
+                notifyError(ERROR_INIT_TIMEOUT, "设备初始化失败，已重试 " + MAX_OPERATION_RETRIES + " 次，请再次点击初始化");
+                currentState = State.IDLE;
+                return;
+            }
+            if (currentState == State.QUERYING_RESOLUTION) {
+                // 分辨率查询失败：使用默认值继续流程
+                NayaxLog.w(TAG, "分辨率查询超时，使用默认分辨率: " + NayaxCommand.RESOLUTION);
+                resolution   = NayaxCommand.RESOLUTION;
+                deviceReady  = true;
+                currentState = State.HEARTBEAT;
+                NayaxCallback cb = this.callback;
+                if (cb != null) cb.onDeviceReady();
+                scheduleHeartbeat();
+                return;
+            }
             notifyError(ERROR_OPERATION_TIMEOUT, "操作响应超时，状态: " + currentState);
             if (paying) {
                 paying = false;
@@ -766,8 +812,12 @@ public class NayaxManager {
         NayaxLog.w(TAG, "操作超时，第 " + operationRetryCount + " 次重试，状态: " + currentState);
         switch (currentState) {
             case REQUESTING_DEDUCTION:
-                int cents = Math.round(paymentAmount / NayaxCommand.RESOLUTION);
-                sendCommand(NayaxCommand.requestDeduction(paymentChannel, cents));
+                int units = Math.round(paymentAmount / resolution);
+                sendCommand(NayaxCommand.requestDeduction(paymentChannel, units));
+                scheduleOperationTimeout();
+                break;
+            case QUERYING_RESOLUTION:
+                sendCommand(NayaxCommand.queryResolution());
                 scheduleOperationTimeout();
                 break;
             case REPORTING_RESULT:
@@ -816,6 +866,7 @@ public class NayaxManager {
 
             case MSG_SEND_RESET:
                 sendReset();
+                scheduleOperationTimeout();  // 无响应时8s内自动重试
                 break;
 
             case MSG_POLL_STATUS:
@@ -839,6 +890,8 @@ public class NayaxManager {
 
             case MSG_RECONNECT:
                 openSerialPort();
+                // 重连后自动发起初始化，无需上层手动调用 init()
+                if (isConnected()) startInit();
                 break;
 
             case MSG_HEARTBEAT:
@@ -847,20 +900,16 @@ public class NayaxManager {
 
             case MSG_STREAM_CHECK:
                 if (!firstDataReceived && serialUtil != null && !deviceReady) {
-                    NayaxLog.w(TAG, "串口打开 1.5s 内未收到任何数据，接收线程可能已死"
-                            + "（LSerialUtil HEX输入流已结束）。\n"
-                            + "请确认 Nayax 设备已上电并连接至 ttyS" + serialPort);
+                    NayaxLog.w(TAG, "串口打开 1.5s 内未收到任何数据，请确认 Nayax 设备已上电并连接至 ttyS" + serialPort);
                 }
                 break;
 
             case MSG_INIT_TIMEOUT:
                 if (!deviceReady) {
-                    NayaxLog.w(TAG, "设备初始化超时，尝试重连");
+                    NayaxLog.w(TAG, "设备初始化超时，串口保持打开，可重新点击初始化");
                     notifyError(ERROR_INIT_TIMEOUT, "设备初始化超时");
-                    cancelAllMessages();
-                    closeSerialPort();
-                    reconnectCount = 0;
-                    attemptReconnect();
+                    currentState = State.IDLE;
+                    // 不自动关闭串口，不自动重连，等待用户手动重新调用 init()
                 }
                 break;
 

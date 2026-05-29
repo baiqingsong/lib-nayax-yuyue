@@ -50,20 +50,67 @@ public final class NayaxCommand {
     }
 
     /**
-     * 刷卡扣款请求
-     * <p>FC=10（写多个寄存器），地址 0x0003（货道）+ 0x0004（价格）</p>
+     * 刷卡扣款请求（协议 3.2.5）
+     * <p>FC=10，地址 0x0003（货道）+ 0x0004（价格），无 byte_count 字段（自定义协议）。</p>
+     *
+     * <p>发送格式：
+     * <pre>
+     * 01 10 00 03 00 02 [chan_H chan_L] [price_H price_L] CRC_L CRC_H
+     * </pre>
+     * 响应格式（正常）：{@code 01 10 00 00 00 02 41 C8}<br>
+     * 响应格式（异常）：{@code 01 90 00 00 00 02 40 16}
+     * </p>
      *
      * <p>适用于 MDB L3 模式（直接扣款）。
      * MDB L1/L2 模式须先等待 {@link CardState#SWIPED} 再调用本指令。</p>
      *
-     * @param channel    货道编号（从 1 开始）
-     * @param amountCents 扣款金额（以分为单位，即 金额元 / {@value #RESOLUTION}）
+     * @param channel     货道编号（从 1 开始）
+     * @param amountUnits 扣款金额（按分辨率换算后的整数单位，如分辨率 0.01 时单位为分）
      */
-    public static String requestDeduction(int channel, int amountCents) {
+    public static String requestDeduction(int channel, int amountUnits) {
         String chanHex  = String.format("%04X", channel & 0xFFFF);
-        String priceHex = String.format("%04X", amountCents & 0xFFFF);
-        // FC=10, start_addr=0x0003, qty=2 寄存器, byte_count=4
-        return appendCRC("011000030002" + "04" + chanHex + priceHex);
+        String priceHex = String.format("%04X", amountUnits & 0xFFFF);
+        // 注意：该协议不包含标准 Modbus RTU FC=10 的 byte_count 字段
+        return appendCRC("011000030002" + chanHex + priceHex);
+    }
+
+    /**
+     * 查询分辨率（协议 3.2.19）
+     * <p>FC=03, 地址 0x00F7, 寄存器数 1</p>
+     * 发送: {@code 01 03 00 F7 00 01 35 F8}<br>
+     * 响应: {@code 01 03 02 00 xx CRC_L CRC_H}
+     * <ul>
+     *   <li>xx=0: 分辨率 0.01</li>
+     *   <li>xx=1: 分辨率 1</li>
+     *   <li>xx=2: 分辨率 10</li>
+     *   <li>xx=3: 分辨率 100</li>
+     * </ul>
+     */
+    public static String queryResolution() {
+        return appendCRC("010300F70001");
+    }
+
+    /**
+     * 从分辨率响应帧中解析实际分辨率值
+     * <p>帧格式与状态响应相同: {@code 01 03 02 00 xx CRC}</p>
+     *
+     * @param frame 已通过 CRC 校验的完整帧
+     * @return 分辨率浮点数（如 0.01f、1.0f、10.0f、100.0f）；解析失败返回默认值 {@value #RESOLUTION}
+     */
+    public static float parseResolutionValue(String frame) {
+        if (!isStatusResponse(frame)) return RESOLUTION;
+        try {
+            int code = Integer.parseInt(frame.substring(8, 10), 16);
+            switch (code) {
+                case 0: return 0.01f;
+                case 1: return 1.0f;
+                case 2: return 10.0f;
+                case 3: return 100.0f;
+                default: return RESOLUTION;
+            }
+        } catch (NumberFormatException e) {
+            return RESOLUTION;
+        }
     }
 
     /**
@@ -153,12 +200,12 @@ public final class NayaxCommand {
 
     /**
      * 判断帧是否为 FC=10 扣款成功响应
-     * <p>设备固件返回起始地址为 0x0000（非标准），以 CRC 校验为准。</p>
+     * <p>设备固件返回的起始地址为 0x0000（非标准）：{@code 01 10 00 00 00 02 CRC}</p>
      */
     public static boolean isDeductionSuccessResponse(String frame) {
         return frame != null
                 && frame.length() == 16
-                && frame.toUpperCase().startsWith("0110")
+                && frame.toUpperCase().startsWith("01100000")
                 && validateCRC(frame);
     }
 

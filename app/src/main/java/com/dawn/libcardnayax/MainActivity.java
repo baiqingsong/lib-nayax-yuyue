@@ -80,6 +80,11 @@ public class MainActivity extends AppCompatActivity {
         NayaxManager.getInstance().connect(7);
     }
 
+    /** 初始化设备（发送复位指令） */
+    public void initDevice(View view) {
+        NayaxManager.getInstance().init();
+    }
+
     /** 断开串口 */
     public void stopPort(View view) {
         NayaxManager.getInstance().disconnect();

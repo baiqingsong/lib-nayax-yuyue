@@ -20,6 +20,14 @@
         android:layout_height="44dp"
         android:layout_marginTop="20dp"
         android:gravity="center"
+        android:text="初始化"
+        android:onClick="initDevice"/>
+
+    <TextView
+        android:layout_width="160dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="20dp"
+        android:gravity="center"
         android:text="关闭串口"
         android:onClick="stopPort"/>
 
